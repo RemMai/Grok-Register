@@ -20,13 +20,30 @@ grok upload                # 手动上传 CPA JSON 到 Management API
 
 | 特性 | 说明 |
 |------|------|
-| **testmail** | `EMAIL_MODE=testmail`，GitHub Student Pack 等；`TESTMAIL_API_KEY` / `NAMESPACE` / `DOMAIN` |
+| **协议优先 + TLS 指纹** | Go `tls-client`（默认 `chrome_131`）过 CF；`CLEARANCE_MODE=auto` 失败再拉 WARP/FS |
+| **Turnstile 屏外有头** | 默认 `TURNSTILE_MODE=offscreen`（非真 headless，降低 600010） |
+| **Castle 空 token** | 当前 `castleRequestToken=""`；风控收紧后再补 offline |
+| **testmail** | `EMAIL_MODE=testmail`，GitHub Student Pack 等 |
 | **cloudflare temp email** | `EMAIL_MODE=cloudflare`，`MAIL_API_BASE` / `MAIL_ADMIN_AUTH` / `MAIL_DOMAIN` / `CLOUDFLARE_AUTH_MODE`（与 GrokRegisterAgent 一致） |
-| **Turnstile 常驻池** | 默认 `turnstile_pool.py` 多浏览器复用 → 回退 one-shot mint → chromedp |
-| **全局座位上限** | `done + reserved ≤ target`，避免多线程超开邮箱/注册 |
-| **交互 `start` / `config`** | 数量与线程**不写** `config.env`；`grok config` 打开配置并刷新 example |
-| **CPA 宿主机路径** | `CPA_MANAGEMENT_BASE=http://127.0.0.1:8317/v0/management`；自动改写 docker 主机名 |
-| **一键安装** | `scripts/install.sh`：可改命令名、安装目录、数据目录 |
+| **Docker / GHCR** | `docker compose` 整栈；Actions 推 `ghcr.io/<owner>/grok-register` |
+| **全局座位上限** | `done + reserved ≤ target` |
+| **CPA 上传 wait** | 结束前等待 Management 上传，避免进程先退出 |
+| **一键安装** | 路径/命令名/WARP/结束停容器交互 |
+
+### 架构三腿
+
+```text
+协议腿  gRPC 发/验码 → Server Action → SSO hop → OAuth → 探活/CPA
+边缘腿  chrome_131 TLS 优先 → CF 拦再 clearance（auto）
+挑战腿  Turnstile 仅 Chromium（offscreen 池 / one-shot）
+```
+
+冒烟（不注册账号）:
+
+```bash
+go run scripts/smoke_protocol.go
+REGISTER_PROXY=http://127.0.0.1:7890 go run scripts/smoke_protocol.go
+```
 
 ---
 
@@ -36,10 +53,39 @@ grok upload                # 手动上传 CPA JSON 到 Management API
 
 | 平台 | 前提 | 默认安装位置 |
 |------|------|----------------|
-| **Linux**（Debian/Ubuntu） | root / sudo | `/opt/Grok-Register`，数据 `/root/.grok` |
+| **Linux**（Debian/Ubuntu） | root / sudo | 源码 `/opt/Grok-Register`；数据优先 **`SUDO_USER` 的 `~/.grok`**（非 `/root`） |
 | **macOS** | 已装 **Homebrew** + **Docker Desktop**（缺则提示安装命令后退出） | `~/Grok-Register`，数据 `~/.grok`，CLI `~/.local/bin` |
 
-会拉源码、编译 CLI、装 Playwright/CloakBrowser、起 clearance、写默认 `config.env`。
+会拉源码、编译 CLI、装 Playwright/CloakBrowser、起 clearance，并写入**分区中文注释**的 `config.env`（与 `config.env.example` 同模板）。
+
+### 交互询问
+
+有真实 TTY 时会依次提示：
+
+1. CLI 命令名 / 源码目录 / 数据目录 / 二进制 / venv  
+2. **是否启用 WARP 清障栈？** `[Y]`  
+   - **Y（默认）**：起 Docker 清障，`REGISTER_PROXY=http://127.0.0.1:40080`  
+   - **N**：不装清障；再问 **本机 HTTP 代理端口**  
+     - 输入如 `7890` → `REGISTER_PROXY=http://127.0.0.1:7890`，`CLEARANCE_ENABLED=0`  
+     - **直接回车** → 直连（无代理，适合能访问 x.ai 的境外 VPS）  
+3. **（WARP 时）运行结束后是否自动关闭清障容器？** `[Y]`  
+   - **Y（默认）**：`CLEARANCE_AUTO_STOP=1`，结束/中断后 `docker compose stop`  
+   - **N**：容器常开；每次 `grok start` 仍会检测并自动拉起未运行的栈
+无 TTY 的 `curl|sudo bash` 可能无法提问，此时：
+
+```bash
+# WARP 清障（默认）
+curl -fsSL .../install.sh | sudo bash -s -- --with-warp
+
+# 本机 Clash 等代理
+curl -fsSL .../install.sh | sudo bash -s -- --no-warp --proxy-port 7890
+
+# 境外 VPS 直连
+curl -fsSL .../install.sh | sudo bash -s -- --no-warp
+
+# 强制全默认（WARP）
+curl -fsSL .../install.sh | sudo NONINTERACTIVE=1 bash
+```
 
 ### Linux 一行
 
@@ -51,10 +97,9 @@ curl -fsSL https://raw.githubusercontent.com/Charles-0509/Grok-Register/main/scr
 |----|------|
 | 命令 | `/usr/local/bin/grok` |
 | 源码 | `/opt/Grok-Register`（软链 `/opt/Grok-Reg`） |
-| 数据 | `/root/.grok` |
+| 数据 | `sudo` 时为 **`/home/<SUDO_USER>/.grok`**，纯 root 为 `/root/.grok` |
 | Python | `/opt/cloakbrowser-venv/bin/python` |
 | mint | `/usr/local/share/grok-reg/turnstile_{mint,pool}.py` |
-
 ### macOS 一行
 
 **先**确认：
@@ -166,6 +211,31 @@ cd ~/Grok-Register/clearance && docker compose up -d && docker compose ps
 | Docker | 清障栈（强烈推荐） | 注册/邮箱/CF 更容易挂 |
 | CPA Management（可选） | `grok upload` / 自动上传 | 本地仍有 `CPA/*.json` |
 
+### 推荐硬件（运行时，非编译）
+
+| 场景 | 内存 | CPU | 说明 |
+|------|------|-----|------|
+| **最低能跑** | **2 GiB** + 2 GiB swap | 1–2 vCPU | 仅 `--thread 1`；清障 + 1 个 Chromium |
+| **舒适** | **4 GiB** | 2–4 vCPU | `--thread 1~2` |
+| **冲量** | **8 GiB+** | 4+ vCPU | `--thread 3~4`（再高收益有限） |
+
+粗算占用（`start -t 1 --thread 1`）：
+
+| 组件 | 约占用 |
+|------|--------|
+| WARP + Privoxy + FlareSolverr | 400–900 MiB |
+| CloakBrowser / Chromium（1 个） | 300–800 MiB |
+| grok CLI + Python mint | 50–150 MiB |
+| 系统 / Docker 开销 | 200–400 MiB |
+| **合计** | **约 1.2–2.5 GiB** 峰值 |
+
+**≤1 GiB 内存的机器会非常卡**（大量 swap）：第一次 `start` 还要冷启动容器镜像层 + 拉起浏览器，更慢。优化：
+
+1. 始终 `--thread 1`（低配禁止 2+）  
+2. 保证 **≥2 GiB swap**（你机上已有 4G swap 是对的）  
+3. 装完后先让 clearance `healthy` 再 start，避免并行拉镜像  
+4. 不要同时跑其它重服务（面板、多开 Docker）  
+5. 可选：不需要自动清障预热时关 `CLEARANCE_ENABLED=0`（成功率可能下降）
 ---
 
 ## 完整部署（手动分步）
@@ -420,13 +490,34 @@ make build && sudo make install
 
 ---
 
+## 边缘 / 清障
+
+```env
+CF_IMPERSONATE=chrome_131
+CF_IMPERSONATE_FALLBACK=chrome_124,chrome_120
+CLEARANCE_MODE=auto    # auto | always | never
+CLEARANCE_ENABLED=1
+CLEARANCE_AUTO_STOP=1
+```
+
+| CLEARANCE_MODE | 行为 |
+|----------------|------|
+| **auto**（默认） | 先 TLS 指纹 warm；403/拦再 `docker compose up` + 预热 |
+| **always** | 启动即清障 |
+| **never** | 不碰 Docker 清障（靠直连/自有代理） |
+
 ## Turnstile
 
-默认 `browser`：
+默认 `browser` + **`TURNSTILE_MODE=offscreen`**：
 
-1. 常驻池 `turnstile_pool.py`（`TURNSTILE_WORKERS`，约 2）  
+1. 常驻池 `turnstile_pool.py`（屏外有头）  
 2. 回退 one-shot `turnstile_mint.py`  
-3. 再回退 chromedp  
+3. 再回退 chromedp 真 headless（不推荐，易 600010）  
+
+```env
+TURNSTILE_PROVIDER=browser
+TURNSTILE_MODE=offscreen   # offscreen | headless | auto
+```
 
 默认**不**注入 FlareSolverr cookie/UA（除非 `GROK_TURNSTILE_INJECT_CLEARANCE=1`）。
 
