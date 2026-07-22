@@ -197,18 +197,30 @@ func (e *Engine) run(ctx context.Context) error {
 		return err
 	}
 	e.mail = email.New(email.Config{
-		Mode:              cfg.EmailMode,
-		Domain:            cfg.EmailDomain,
-		API:               cfg.EmailAPI,
-		LOLRetries:        cfg.TempmailLOLRetries,
-		LOLIntervalMS:     cfg.TempmailLOLIntervalMS,
-		TestmailAPIKey:    cfg.TestmailAPIKey,
-		TestmailNamespace: cfg.TestmailNamespace,
-		TestmailDomain:    cfg.TestmailDomain,
+		Mode:                 cfg.EmailMode,
+		Domain:               cfg.EmailDomain,
+		API:                  cfg.EmailAPI,
+		LOLRetries:           cfg.TempmailLOLRetries,
+		LOLIntervalMS:        cfg.TempmailLOLIntervalMS,
+		TestmailAPIKey:       cfg.TestmailAPIKey,
+		TestmailNamespace:    cfg.TestmailNamespace,
+		TestmailDomain:       cfg.TestmailDomain,
+		MailAPIBase:          cfg.MailAPIBase,
+		MailAdminAuth:        cfg.MailAdminAuth,
+		MailDomain:           cfg.MailDomain,
+		CloudflareAuthMode:   cfg.CloudflareAuthMode,
+		CloudflareCreatePath: cfg.CloudflareCreatePath,
 	})
-	if cfg.EmailMode == config.EmailTestmail {
+	switch cfg.EmailMode {
+	case config.EmailTestmail:
 		log.Infof("Email mode=testmail namespace=%s domain=%s", cfg.TestmailNamespace, cfg.TestmailDomain)
-	} else {
+	case config.EmailCloudflare:
+		dom := cfg.MailDomain
+		if dom == "" {
+			dom = cfg.EmailDomain
+		}
+		log.Infof("Email mode=cloudflare base=%s domain=%s auth=%s", cfg.MailAPIBase, dom, cfg.CloudflareAuthMode)
+	default:
 		log.Infof("Email mode=%s", cfg.EmailMode)
 	}
 	e.turn = turnstile.New(turnstile.Options{

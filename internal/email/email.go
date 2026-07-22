@@ -1,6 +1,7 @@
 package email
 
 import (
+	"bytes"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -16,25 +17,32 @@ import (
 )
 
 var bannedDomains = map[string]struct{}{
-	"duckmail.sbs":     {},
-	"web-library.net":  {},
-	"mail.tm":          {},
-	"mail.gw":          {},
-	"baldur.edu.kg":    {},
+	"duckmail.sbs":    {},
+	"web-library.net": {},
+	"mail.tm":         {},
+	"mail.gw":         {},
+	"baldur.edu.kg":   {},
 }
 
 var codeRe = []*regexp.Regexp{
+	// Grok/x.ai: XXX-XXX (prefer tagged HTML first)
+	regexp.MustCompile(`(?i)(?:verification code|验证码|your code)[:\s]*[<>\s]*([A-Z0-9]{3}-[A-Z0-9]{3})\b`),
 	regexp.MustCompile(`>([A-Z0-9]{3}-[A-Z0-9]{3})<`),
+	regexp.MustCompile(`\b([A-Z0-9]{3}-[A-Z0-9]{3})\b`),
 	regexp.MustCompile(`>([A-Z0-9]{6})<`),
 	regexp.MustCompile(`\b([A-Z0-9]{3}-?[A-Z0-9]{3})\b`),
+	// 6-digit OTP (exclude common false positive 177010 from x.ai templates)
+	regexp.MustCompile(`(?i)Subject:.*?(\d{6})`),
+	regexp.MustCompile(`>\s*(\d{6})\s*<`),
+	regexp.MustCompile(`\b(\d{6})\b`),
 }
 
 type Handle struct {
-	Kind     string // lol | mt | custom | testmail
+	Kind     string // lol | mt | custom | testmail | cf
 	Email    string
 	Password string
 	Token    string
-	Base     string // mail.tm base
+	Base     string // mail.tm / cloudflare worker base
 	// testmail.app
 	Tag       string
 	Timestamp int64 // ms — only accept mails after Create()
@@ -57,7 +65,13 @@ type Config struct {
 	TestmailAPIKey    string
 	TestmailNamespace string
 	TestmailDomain    string
-	HTTPClient        *http.Client
+	// cloudflare_temp_email
+	MailAPIBase          string
+	MailAdminAuth        string
+	MailDomain           string
+	CloudflareAuthMode   string
+	CloudflareCreatePath string
+	HTTPClient           *http.Client
 }
 
 func New(cfg Config) *Provider {
@@ -70,6 +84,15 @@ func New(cfg Config) *Provider {
 	if cfg.LOLIntervalMS <= 0 {
 		cfg.LOLIntervalMS = 400
 	}
+	if cfg.CloudflareAuthMode == "" {
+		cfg.CloudflareAuthMode = "x-admin-auth"
+	}
+	cfg.MailAPIBase = config.NormalizeMailAPIBase(cfg.MailAPIBase)
+	cfg.CloudflareAuthMode = config.NormalizeCloudflareAuthMode(cfg.CloudflareAuthMode)
+	cfg.MailDomain = strings.Trim(strings.TrimSpace(cfg.MailDomain), "@")
+	if cfg.MailDomain == "" {
+		cfg.MailDomain = strings.Trim(strings.TrimSpace(cfg.Domain), "@")
+	}
 	return &Provider{cfg: cfg}
 }
 
@@ -78,6 +101,25 @@ func randStr(n int) string {
 	b := make([]byte, n)
 	for i := range b {
 		b[i] = letters[rand.Intn(len(letters))]
+	}
+	return string(b)
+}
+
+// randLocal generates local-part starting with a letter (CF / mail.tm friendly).
+func randLocal(minLen, maxLen int) string {
+	if minLen < 2 {
+		minLen = 2
+	}
+	if maxLen < minLen {
+		maxLen = minLen
+	}
+	n := minLen + rand.Intn(maxLen-minLen+1)
+	const letters = "abcdefghijklmnopqrstuvwxyz"
+	const alnum = "abcdefghijklmnopqrstuvwxyz0123456789"
+	b := make([]byte, n)
+	b[0] = letters[rand.Intn(len(letters))]
+	for i := 1; i < n; i++ {
+		b[i] = alnum[rand.Intn(len(alnum))]
 	}
 	return string(b)
 }
@@ -94,6 +136,15 @@ func (p *Provider) Create() (Handle, error) {
 			return Handle{}, err
 		}
 		h.Password = password
+		return h, nil
+	case config.EmailCloudflare:
+		h, err := p.cfCreate()
+		if err != nil {
+			return Handle{}, err
+		}
+		if h.Password == "" {
+			h.Password = password
+		}
 		return h, nil
 	default:
 		// tempmail.lol then mail.tm family
@@ -219,9 +270,6 @@ func (p *Provider) mailtmCreate(base, password string) (Handle, error) {
 	rand.Shuffle(len(doms), func(i, j int) { doms[i], doms[j] = doms[j], doms[i] })
 	var last error
 	for _, dom := range doms {
-		if len(doms) > 6 {
-			// try at most 6
-		}
 		email := fmt.Sprintf("oc%s@%s", randStr(10), dom)
 		payload := map[string]string{"address": email, "password": password}
 		raw, _ := json.Marshal(payload)
@@ -251,6 +299,346 @@ func (p *Provider) mailtmCreate(base, password string) (Handle, error) {
 		last = fmt.Errorf("mailtm create failed")
 	}
 	return Handle{}, last
+}
+
+// ---------- Cloudflare Temp Email (dreamhunter2333/cloudflare_temp_email) ----------
+
+func (p *Provider) cfAuthMode() string {
+	return config.NormalizeCloudflareAuthMode(p.cfg.CloudflareAuthMode)
+}
+
+func (p *Provider) cfCreatePath() string {
+	raw := strings.TrimSpace(p.cfg.CloudflareCreatePath)
+	if raw != "" {
+		if !strings.HasPrefix(raw, "/") {
+			raw = "/" + raw
+		}
+		return raw
+	}
+	if p.cfAuthMode() == "none" {
+		return "/api/new_address"
+	}
+	return "/admin/new_address"
+}
+
+func (p *Provider) cfAuthHeaders(contentType bool) http.Header {
+	h := make(http.Header)
+	if contentType {
+		h.Set("Content-Type", "application/json")
+	}
+	h.Set("Accept", "application/json")
+	key := strings.TrimSpace(p.cfg.MailAdminAuth)
+	mode := p.cfAuthMode()
+	if key == "" || mode == "none" {
+		return h
+	}
+	switch mode {
+	case "x-admin-auth":
+		h.Set("x-admin-auth", key)
+	case "x-api-key":
+		h.Set("X-API-Key", key)
+	case "bearer":
+		h.Set("Authorization", "Bearer "+key)
+	}
+	return h
+}
+
+func (p *Provider) cfCreate() (Handle, error) {
+	base := config.NormalizeMailAPIBase(p.cfg.MailAPIBase)
+	if base == "" {
+		return Handle{}, fmt.Errorf("cloudflare: set MAIL_API_BASE to Worker API root (not Pages frontend)")
+	}
+	mode := p.cfAuthMode()
+	key := strings.TrimSpace(p.cfg.MailAdminAuth)
+	if mode != "none" && key == "" {
+		return Handle{}, fmt.Errorf("cloudflare: MAIL_ADMIN_AUTH required when CLOUDFLARE_AUTH_MODE=%s", mode)
+	}
+	createPath := p.cfCreatePath()
+	isAdmin := strings.HasSuffix(strings.ToLower(strings.TrimRight(createPath, "/")), "/admin/new_address")
+	domain := strings.Trim(strings.TrimSpace(p.cfg.MailDomain), "@")
+	if domain == "" {
+		domain = strings.Trim(strings.TrimSpace(p.cfg.Domain), "@")
+	}
+
+	var last error
+	for attempt := 0; attempt < 5; attempt++ {
+		local := randLocal(8, 13)
+		if isAdmin && domain == "" {
+			return Handle{}, fmt.Errorf("cloudflare: MAIL_DOMAIN required for admin create (/admin/new_address)")
+		}
+		var payload map[string]any
+		if isAdmin {
+			payload = map[string]any{
+				"name":         local,
+				"domain":       domain,
+				"enablePrefix": false,
+			}
+		} else {
+			payload = map[string]any{}
+			if domain != "" {
+				payload["domain"] = domain
+			}
+		}
+		createURL := base + createPath
+		if mode == "query-key" && key != "" {
+			sep := "?"
+			if strings.Contains(createURL, "?") {
+				sep = "&"
+			}
+			createURL = createURL + sep + "key=" + url.QueryEscape(key)
+		}
+		raw, _ := json.Marshal(payload)
+		req, err := http.NewRequest(http.MethodPost, createURL, bytes.NewReader(raw))
+		if err != nil {
+			return Handle{}, err
+		}
+		req.Header = p.cfAuthHeaders(true)
+		resp, err := p.cfg.HTTPClient.Do(req)
+		if err != nil {
+			last = fmt.Errorf("%v | url=%s", err, createURL)
+			continue
+		}
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		_ = resp.Body.Close()
+		if resp.StatusCode == 200 || resp.StatusCode == 201 {
+			var data map[string]any
+			if err := json.Unmarshal(body, &data); err != nil {
+				last = fmt.Errorf("invalid json: %s", truncate(string(body), 120))
+				continue
+			}
+			jwt, _ := data["jwt"].(string)
+			address, _ := data["address"].(string)
+			if address == "" && domain != "" {
+				address = local + "@" + domain
+			}
+			pw, _ := data["password"].(string)
+			if jwt != "" && address != "" {
+				return Handle{
+					Kind:     "cf",
+					Email:    address,
+					Password: pw,
+					Token:    jwt,
+					Base:     base,
+				}, nil
+			}
+			last = fmt.Errorf("response missing jwt/address: %s", truncate(string(body), 160))
+			continue
+		}
+		msg := fmt.Sprintf("HTTP %d: %s | url=%s", resp.StatusCode, truncate(strings.TrimSpace(string(body)), 200), createURL)
+		if resp.StatusCode == 405 {
+			msg += " | tip: 405 usually means MAIL_API_BASE is Pages frontend or wrong path; admin=/admin/new_address anon=/api/new_address"
+		}
+		if resp.StatusCode == 401 || resp.StatusCode == 403 {
+			msg += fmt.Sprintf(" | tip: auth failed mode=%s, try none|x-admin-auth|bearer|x-api-key", mode)
+		}
+		last = fmt.Errorf("%s", msg)
+		if resp.StatusCode == 400 || resp.StatusCode == 409 {
+			continue
+		}
+		break
+	}
+	if last == nil {
+		last = fmt.Errorf("cloudflare create failed")
+	}
+	return Handle{}, last
+}
+
+func (p *Provider) cfFetch(h Handle) (string, error) {
+	base := strings.TrimRight(h.Base, "/")
+	if base == "" {
+		base = config.NormalizeMailAPIBase(p.cfg.MailAPIBase)
+	}
+	if base == "" || h.Token == "" {
+		return "", fmt.Errorf("cloudflare fetch: missing base/jwt")
+	}
+	// list
+	listURL := base + "/api/mails?limit=20&offset=0"
+	req, err := http.NewRequest(http.MethodGet, listURL, nil)
+	if err != nil {
+		return "", err
+	}
+	req.Header.Set("Authorization", "Bearer "+h.Token)
+	req.Header.Set("Accept", "application/json")
+	resp, err := p.cfg.HTTPClient.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	body, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+	if resp.StatusCode != 200 {
+		return "", fmt.Errorf("cloudflare list http=%d body=%s", resp.StatusCode, truncate(string(body), 80))
+	}
+	msgs := parseMailList(body)
+	if len(msgs) == 0 {
+		return "", nil
+	}
+	var b strings.Builder
+	for _, m := range msgs {
+		subj, _ := m["subject"].(string)
+		text := messageBodyText(m)
+		// list often has only preview — pull detail when body empty
+		if text == "" {
+			if id := anyToString(m["id"]); id != "" {
+				if detail := p.cfFetchDetail(base, h.Token, id); detail != nil {
+					if s, _ := detail["subject"].(string); s != "" && subj == "" {
+						subj = s
+					}
+					if d := messageBodyText(detail); d != "" {
+						text = d
+					}
+				}
+			}
+		}
+		if prev, _ := m["bodyPreview"].(string); text == "" && prev != "" {
+			text = prev
+		}
+		if intro, _ := m["intro"].(string); text == "" && intro != "" {
+			text = intro
+		}
+		if subj != "" {
+			fmt.Fprintf(&b, "Subject: %s\n", subj)
+		}
+		b.WriteString(text)
+		b.WriteByte('\n')
+	}
+	return b.String(), nil
+}
+
+func (p *Provider) cfFetchDetail(base, jwt, id string) map[string]any {
+	for _, path := range []string{"/api/mail/" + url.PathEscape(id), "/api/mails/" + url.PathEscape(id)} {
+		req, err := http.NewRequest(http.MethodGet, base+path, nil)
+		if err != nil {
+			continue
+		}
+		req.Header.Set("Authorization", "Bearer "+jwt)
+		req.Header.Set("Accept", "application/json")
+		resp, err := p.cfg.HTTPClient.Do(req)
+		if err != nil {
+			continue
+		}
+		body, _ := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
+		_ = resp.Body.Close()
+		if resp.StatusCode != 200 {
+			continue
+		}
+		var data map[string]any
+		if err := json.Unmarshal(body, &data); err != nil {
+			continue
+		}
+		if ok, _ := data["success"].(bool); data["success"] != nil && !ok {
+			continue
+		}
+		if inner, ok := data["data"].(map[string]any); ok {
+			return inner
+		}
+		return data
+	}
+	return nil
+}
+
+func parseMailList(body []byte) []map[string]any {
+	var raw any
+	if err := json.Unmarshal(body, &raw); err != nil {
+		return nil
+	}
+	switch v := raw.(type) {
+	case []any:
+		return dictSlice(v)
+	case map[string]any:
+		if ok, _ := v["success"].(bool); v["success"] != nil && !ok {
+			return nil
+		}
+		if inner, ok := v["data"].(map[string]any); ok {
+			v = inner
+		}
+		for _, key := range []string{
+			"hydra:member", "results", "messages", "mails", "emails", "data", "items", "list", "records",
+		} {
+			if arr, ok := v[key].([]any); ok {
+				return dictSlice(arr)
+			}
+			if nested, ok := v[key].(map[string]any); ok {
+				for _, k2 := range []string{"results", "items", "list", "hydra:member"} {
+					if arr, ok := nested[k2].([]any); ok {
+						return dictSlice(arr)
+					}
+				}
+			}
+		}
+	}
+	return nil
+}
+
+func dictSlice(arr []any) []map[string]any {
+	out := make([]map[string]any, 0, len(arr))
+	for _, it := range arr {
+		if m, ok := it.(map[string]any); ok {
+			out = append(out, m)
+		}
+	}
+	return out
+}
+
+func messageBodyText(msg map[string]any) string {
+	if msg == nil {
+		return ""
+	}
+	var parts []string
+	for _, key := range []string{"raw", "text", "html", "body", "bodyText", "bodyHtml", "content"} {
+		v := msg[key]
+		if v == nil {
+			continue
+		}
+		switch t := v.(type) {
+		case string:
+			if t != "" {
+				parts = append(parts, t)
+			}
+		case []any:
+			var sb strings.Builder
+			for _, x := range t {
+				if x != nil {
+					sb.WriteString(fmt.Sprint(x))
+					sb.WriteByte('\n')
+				}
+			}
+			if s := strings.TrimSpace(sb.String()); s != "" {
+				parts = append(parts, s)
+			}
+		case map[string]any:
+			for _, sk := range []string{"text", "html", "body", "value", "content"} {
+				if s, ok := t[sk].(string); ok && s != "" {
+					parts = append(parts, s)
+				}
+			}
+		default:
+			s := strings.TrimSpace(fmt.Sprint(t))
+			if s != "" && s != "<nil>" {
+				parts = append(parts, s)
+			}
+		}
+	}
+	return strings.TrimSpace(strings.Join(parts, "\n"))
+}
+
+func anyToString(v any) string {
+	switch t := v.(type) {
+	case string:
+		return t
+	case float64:
+		// JSON numbers often land as float64
+		if t == float64(int64(t)) {
+			return fmt.Sprintf("%d", int64(t))
+		}
+		return fmt.Sprintf("%v", t)
+	case json.Number:
+		return t.String()
+	default:
+		if v == nil {
+			return ""
+		}
+		return fmt.Sprint(v)
+	}
 }
 
 func (p *Provider) PollCode(h Handle, maxWait time.Duration) (string, error) {
@@ -336,6 +724,8 @@ func (p *Provider) fetch(h Handle) (string, error) {
 		return string(b2), nil
 	case "testmail":
 		return p.testmailFetch(h)
+	case "cf":
+		return p.cfFetch(h)
 	default:
 		return "", fmt.Errorf("unknown handle kind")
 	}
@@ -401,7 +791,11 @@ func (p *Provider) testmailFetch(h Handle) (string, error) {
 func extractCode(text string) string {
 	for _, re := range codeRe {
 		if m := re.FindStringSubmatch(text); len(m) > 1 {
-			return strings.ReplaceAll(m[1], "-", "")
+			code := m[1]
+			if code == "177010" {
+				continue
+			}
+			return strings.ReplaceAll(code, "-", "")
 		}
 	}
 	return ""

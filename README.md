@@ -21,6 +21,7 @@ grok upload                # 手动上传 CPA JSON 到 Management API
 | 特性 | 说明 |
 |------|------|
 | **testmail** | `EMAIL_MODE=testmail`，GitHub Student Pack 等；`TESTMAIL_API_KEY` / `NAMESPACE` / `DOMAIN` |
+| **cloudflare temp email** | `EMAIL_MODE=cloudflare`，`MAIL_API_BASE` / `MAIL_ADMIN_AUTH` / `MAIL_DOMAIN` / `CLOUDFLARE_AUTH_MODE`（与 GrokRegisterAgent 一致） |
 | **Turnstile 常驻池** | 默认 `turnstile_pool.py` 多浏览器复用 → 回退 one-shot mint → chromedp |
 | **全局座位上限** | `done + reserved ≤ target`，避免多线程超开邮箱/注册 |
 | **交互 `start` / `config`** | 数量与线程**不写** `config.env`；`grok config` 打开配置并刷新 example |
@@ -318,6 +319,12 @@ EMAIL_MODE=tempmail
 # EMAIL_MODE=custom
 # EMAIL_DOMAIN=example.com
 # EMAIL_API=http://127.0.0.1:8080
+
+# EMAIL_MODE=cloudflare
+# MAIL_API_BASE=https://your-worker.workers.dev
+# MAIL_ADMIN_AUTH=your-admin-password
+# MAIL_DOMAIN=example.com
+# CLOUDFLARE_AUTH_MODE=x-admin-auth
 ```
 
 `tempmail` = tempmail.lol + mail.tm 系 fallback，**无需私人 Token**。  

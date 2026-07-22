@@ -16,9 +16,10 @@ var embeddedExample string
 type EmailMode string
 
 const (
-	EmailTempmail EmailMode = "tempmail"
-	EmailTestmail EmailMode = "testmail"
-	EmailCustom   EmailMode = "custom"
+	EmailTempmail   EmailMode = "tempmail"
+	EmailTestmail   EmailMode = "testmail"
+	EmailCustom     EmailMode = "custom"
+	EmailCloudflare EmailMode = "cloudflare" // dreamhunter2333/cloudflare_temp_email
 )
 
 type Config struct {
@@ -31,6 +32,17 @@ type Config struct {
 	TestmailNamespace string
 	TestmailDomain    string // default inbox.testmail.app
 
+	// Cloudflare Temp Email (dreamhunter2333/cloudflare_temp_email / vmail)
+	// MAIL_API_BASE = Worker API root (not Pages frontend)
+	// MAIL_ADMIN_AUTH = admin password / API key (unused when auth_mode=none)
+	// MAIL_DOMAIN / EMAIL_DOMAIN = create domain for admin path
+	// CLOUDFLARE_AUTH_MODE = none | x-admin-auth | bearer | x-api-key | query-key
+	MailAPIBase          string
+	MailAdminAuth        string
+	MailDomain           string
+	CloudflareAuthMode   string
+	CloudflareCreatePath string
+
 	ClearanceEnabled bool
 	RegisterProxy    string
 	FlareSolverrURL  string
@@ -39,8 +51,8 @@ type Config struct {
 
 	// Target / TurnstileWorkers are RUNTIME-ONLY (CLI or interactive start).
 	// Not loaded from or saved to config.env.
-	Target           int
-	PhysicalCap      int
+	Target            int
+	PhysicalCap       int
 	TurnstileProvider string
 	LiteSolverURL     string
 	TurnstileWorkers  int // 1-8 concurrent register/mint threads; set by start
@@ -75,6 +87,7 @@ func Defaults() Config {
 		EmailMode:             EmailTempmail,
 		EmailAPI:              "http://127.0.0.1:8080",
 		TestmailDomain:        "inbox.testmail.app",
+		CloudflareAuthMode:    "x-admin-auth",
 		ClearanceEnabled:      true,
 		RegisterProxy:         "http://127.0.0.1:40080",
 		FlareSolverrURL:       "http://127.0.0.1:8191",
@@ -129,9 +142,21 @@ func Save(path string, cfg Config) error {
 	if cfg.EmailAPI != "" {
 		b.WriteString(fmt.Sprintf("EMAIL_API=%s\n", cfg.EmailAPI))
 	}
-	// testmail secrets: never auto-written (set manually)
+	// testmail / mail secrets: never auto-written (set manually)
 	if cfg.TestmailDomain != "" {
 		b.WriteString(fmt.Sprintf("TESTMAIL_DOMAIN=%s\n", cfg.TestmailDomain))
+	}
+	if cfg.MailAPIBase != "" {
+		b.WriteString(fmt.Sprintf("MAIL_API_BASE=%s\n", cfg.MailAPIBase))
+	}
+	if cfg.MailDomain != "" {
+		b.WriteString(fmt.Sprintf("MAIL_DOMAIN=%s\n", cfg.MailDomain))
+	}
+	if cfg.CloudflareAuthMode != "" {
+		b.WriteString(fmt.Sprintf("CLOUDFLARE_AUTH_MODE=%s\n", cfg.CloudflareAuthMode))
+	}
+	if cfg.CloudflareCreatePath != "" {
+		b.WriteString(fmt.Sprintf("CLOUDFLARE_CREATE_PATH=%s\n", cfg.CloudflareCreatePath))
 	}
 	b.WriteString(fmt.Sprintf("CLEARANCE_ENABLED=%s\n", bool01(cfg.ClearanceEnabled)))
 	b.WriteString(fmt.Sprintf("REGISTER_PROXY=%s\n", cfg.RegisterProxy))
@@ -168,7 +193,8 @@ func InteractiveSetup(path string) (Config, error) {
 	fmt.Println("  [1] 免费临时邮箱           (tempmail.lol · 默认 · 直接回车)")
 	fmt.Println("  [2] testmail.app           (GitHub Student Pack Essential 等)")
 	fmt.Println("  [3] 自建域名邮箱           (Cloudflare Email Routing + webhook)")
-	fmt.Print("输入 1 / 2 / 3 [1]: ")
+	fmt.Println("  [4] Cloudflare Temp Email  (cloudflare_temp_email Worker API)")
+	fmt.Print("输入 1 / 2 / 3 / 4 [1]: ")
 	reader := bufio.NewReader(os.Stdin)
 	line, _ := reader.ReadString('\n')
 	line = strings.TrimSpace(line)
@@ -200,6 +226,26 @@ func InteractiveSetup(path string) (Config, error) {
 			api = "http://127.0.0.1:8080"
 		}
 		cfg.EmailAPI = api
+	case "4":
+		cfg.EmailMode = EmailCloudflare
+		fmt.Print("  MAIL_API_BASE (Worker API 根, 如 https://xxx.workers.dev): ")
+		base, _ := reader.ReadString('\n')
+		cfg.MailAPIBase = NormalizeMailAPIBase(strings.TrimSpace(base))
+		fmt.Print("  CLOUDFLARE_AUTH_MODE [x-admin-auth] (none/x-admin-auth/bearer/x-api-key): ")
+		mode, _ := reader.ReadString('\n')
+		mode = strings.TrimSpace(mode)
+		if mode == "" {
+			mode = "x-admin-auth"
+		}
+		cfg.CloudflareAuthMode = NormalizeCloudflareAuthMode(mode)
+		if cfg.CloudflareAuthMode != "none" {
+			fmt.Print("  MAIL_ADMIN_AUTH (admin 密码 / API key): ")
+			auth, _ := reader.ReadString('\n')
+			cfg.MailAdminAuth = strings.TrimSpace(auth)
+		}
+		fmt.Print("  MAIL_DOMAIN (admin 创建必填, 如 example.com): ")
+		dom, _ := reader.ReadString('\n')
+		cfg.MailDomain = strings.Trim(strings.TrimSpace(dom), "@")
 	default:
 		cfg.EmailMode = EmailTempmail
 	}
@@ -211,6 +257,13 @@ func InteractiveSetup(path string) (Config, error) {
 		f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
 		if err == nil {
 			_, _ = fmt.Fprintf(f, "TESTMAIL_API_KEY=%s\nTESTMAIL_NAMESPACE=%s\n", cfg.TestmailAPIKey, cfg.TestmailNamespace)
+			_ = f.Close()
+		}
+	}
+	if cfg.EmailMode == EmailCloudflare && cfg.MailAdminAuth != "" {
+		f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o600)
+		if err == nil {
+			_, _ = fmt.Fprintf(f, "MAIL_ADMIN_AUTH=%s\n", cfg.MailAdminAuth)
 			_ = f.Close()
 		}
 	}
@@ -278,7 +331,7 @@ func parseEnvFile(content string) map[string]string {
 
 func applyMap(cfg *Config, env map[string]string) {
 	if v, ok := env["EMAIL_MODE"]; ok {
-		cfg.EmailMode = EmailMode(strings.ToLower(v))
+		cfg.EmailMode = NormalizeEmailMode(v)
 	}
 	if v, ok := env["EMAIL_DOMAIN"]; ok {
 		cfg.EmailDomain = v
@@ -294,6 +347,37 @@ func applyMap(cfg *Config, env map[string]string) {
 	}
 	if v, ok := env["TESTMAIL_DOMAIN"]; ok {
 		cfg.TestmailDomain = v
+	}
+	if v, ok := env["MAIL_API_BASE"]; ok {
+		cfg.MailAPIBase = NormalizeMailAPIBase(v)
+	}
+	// Accept agent-style aliases
+	if v, ok := env["CF_TEMP_EMAIL_API"]; ok && cfg.MailAPIBase == "" {
+		cfg.MailAPIBase = NormalizeMailAPIBase(v)
+	}
+	if v, ok := env["MAIL_ADMIN_AUTH"]; ok {
+		cfg.MailAdminAuth = v
+	}
+	if v, ok := env["CF_TEMP_EMAIL_AUTH"]; ok && cfg.MailAdminAuth == "" {
+		cfg.MailAdminAuth = v
+	}
+	if v, ok := env["MAIL_DOMAIN"]; ok {
+		cfg.MailDomain = strings.Trim(strings.TrimSpace(v), "@")
+	}
+	if v, ok := env["CLOUDFLARE_AUTH_MODE"]; ok {
+		cfg.CloudflareAuthMode = NormalizeCloudflareAuthMode(v)
+	}
+	if v, ok := env["MAIL_AUTH_MODE"]; ok && cfg.CloudflareAuthMode == "" {
+		cfg.CloudflareAuthMode = NormalizeCloudflareAuthMode(v)
+	}
+	if v, ok := env["CF_AUTH_MODE"]; ok && cfg.CloudflareAuthMode == "" {
+		cfg.CloudflareAuthMode = NormalizeCloudflareAuthMode(v)
+	}
+	if v, ok := env["CLOUDFLARE_CREATE_PATH"]; ok {
+		cfg.CloudflareCreatePath = strings.TrimSpace(v)
+	}
+	if v, ok := env["MAIL_CREATE_PATH"]; ok && cfg.CloudflareCreatePath == "" {
+		cfg.CloudflareCreatePath = strings.TrimSpace(v)
 	}
 	if v, ok := env["CLEARANCE_ENABLED"]; ok {
 		cfg.ClearanceEnabled = truthy(v)
@@ -382,7 +466,63 @@ func applyMap(cfg *Config, env map[string]string) {
 	}
 }
 
+// NormalizeEmailMode maps agent / user aliases to canonical modes.
+func NormalizeEmailMode(raw string) EmailMode {
+	v := strings.ToLower(strings.TrimSpace(raw))
+	switch v {
+	case "cf", "temp_email", "vmail", "cloudflare_temp_email", "cloudflare-temp-email", "cloudflare":
+		return EmailCloudflare
+	case "testmail", "test":
+		return EmailTestmail
+	case "custom", "webhook", "selfhost":
+		return EmailCustom
+	case "tempmail", "lol", "tempmail.lol", "":
+		return EmailTempmail
+	default:
+		return EmailMode(v)
+	}
+}
 
+// NormalizeMailAPIBase strips common mistaken path suffixes from Worker root.
+func NormalizeMailAPIBase(raw string) string {
+	base := strings.TrimRight(strings.TrimSpace(raw), "/")
+	if base == "" {
+		return ""
+	}
+	lower := strings.ToLower(base)
+	for _, suffix := range []string{
+		"/admin/new_address",
+		"/admin",
+		"/api/mails",
+		"/api/new_address",
+		"/api",
+	} {
+		if strings.HasSuffix(lower, suffix) {
+			base = strings.TrimRight(base[:len(base)-len(suffix)], "/")
+			lower = strings.ToLower(base)
+		}
+	}
+	return base
+}
+
+// NormalizeCloudflareAuthMode canonicalizes auth mode names.
+func NormalizeCloudflareAuthMode(raw string) string {
+	m := strings.ToLower(strings.TrimSpace(raw))
+	switch m {
+	case "", "password", "admin_password", "admin", "x-admin", "admin-auth":
+		return "x-admin-auth"
+	case "none", "anonymous", "anon", "public":
+		return "none"
+	case "bearer", "authorization", "jwt":
+		return "bearer"
+	case "x-api-key", "apikey", "api-key", "api_key":
+		return "x-api-key"
+	case "query-key", "query", "query_key", "key":
+		return "query-key"
+	default:
+		return m
+	}
+}
 
 func truthy(v string) bool {
 	v = strings.ToLower(strings.TrimSpace(v))

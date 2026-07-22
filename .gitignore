@@ -31,3 +31,7 @@ __pycache__/
 # Logs / runtime (should never be committed)
 *.log
 logs/
+
+# Local toolchains / test artifacts
+.tools/
+
