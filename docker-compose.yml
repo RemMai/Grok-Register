@@ -1,0 +1,130 @@
+# Grok-Register full stack: app + Cloudflare clearance (WARP / Privoxy / FlareSolverr)
+#
+#   docker compose build
+#   docker compose up -d
+#   # edit data volume config:
+#   docker compose exec grok cat /data/config.env
+#   docker compose exec grok grok start -t 5 --thread 2
+#   docker compose exec grok grok status
+#   docker compose exec grok grok logs -f
+#
+# Data persists in named volume `grok-data` (or bind-mount ./data).
+
+services:
+  grok:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      args:
+        VERSION: "0.1.0"
+    image: remmai/grok-register:latest
+    container_name: grok-register
+    restart: unless-stopped
+    environment:
+      GROK_HOME: /data
+      GROK_PYTHON: /usr/local/bin/python3
+      CHROME_PATH: /usr/bin/chromium
+      DISPLAY: ":99"
+      ENABLE_XVFB: "1"
+      # Clearance inside compose network (service DNS names)
+      CLEARANCE_ENABLED: ${CLEARANCE_ENABLED:-1}
+      REGISTER_PROXY: ${REGISTER_PROXY:-http://privoxy:8118}
+      FLARESOLVERR_URL: ${FLARESOLVERR_URL:-http://flaresolverr:8191}
+      CLEARANCE_PROXY: ${CLEARANCE_PROXY:-http://privoxy:8118}
+      CLEARANCE_URLS: ${CLEARANCE_URLS:-https://accounts.x.ai,https://x.ai,https://status.x.ai,https://console.x.ai,https://auth.x.ai}
+      HTTP_PROXY: ${HTTP_PROXY:-}
+      HTTPS_PROXY: ${HTTPS_PROXY:-}
+      NO_PROXY: ${NO_PROXY:-localhost,127.0.0.1,privoxy,flaresolverr,warp-proxy}
+      TZ: ${TZ:-Asia/Shanghai}
+    volumes:
+      # Persist config / logs / CPA outputs
+      - ${GROK_DATA_DIR:-grok-data}:/data
+    depends_on:
+      privoxy:
+        condition: service_started
+      flaresolverr:
+        condition: service_started
+    # Default keeps container alive with help then sleep via CMD override for long-running shell use.
+    # Prefer: docker compose run --rm grok start -t 5 --thread 2
+    command: ["idle"]
+    stdin_open: true
+    tty: true
+    shm_size: "1gb"
+    security_opt:
+      - seccomp:unconfined
+    cap_add:
+      - SYS_ADMIN
+    networks:
+      - grok-net
+
+  warp-proxy:
+    image: caomingjun/warp:latest
+    container_name: grok-clearance-warp
+    restart: unless-stopped
+    environment:
+      WARP_SLEEP: "2"
+      # WARP_LICENSE_KEY: ${WARP_LICENSE_KEY:-}
+    cap_add:
+      - NET_ADMIN
+      - SYS_MODULE
+    sysctls:
+      net.ipv6.conf.all.disable_ipv6: 0
+      net.ipv4.conf.all.src_valid_mark: 1
+    ports:
+      - "127.0.0.1:${WARP_SOCKS_PORT:-40000}:1080"
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import socket; s=socket.create_connection(('127.0.0.1', 1080), 5); s.close()\""]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    networks:
+      - grok-net
+
+  privoxy:
+    image: vimagick/privoxy:latest
+    container_name: grok-clearance-privoxy
+    restart: unless-stopped
+    depends_on:
+      warp-proxy:
+        condition: service_started
+    volumes:
+      - ./clearance/privoxy-warp.conf:/etc/privoxy/config:ro
+    ports:
+      - "127.0.0.1:${PRIVOXY_PORT:-40080}:8118"
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z 127.0.0.1 8118 || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - grok-net
+
+  flaresolverr:
+    image: ghcr.io/flaresolverr/flaresolverr:latest
+    container_name: grok-clearance-flaresolverr
+    restart: unless-stopped
+    environment:
+      LOG_LEVEL: ${FLARESOLVERR_LOG_LEVEL:-info}
+      TZ: ${TZ:-Asia/Shanghai}
+    ports:
+      - "127.0.0.1:${FLARESOLVERR_PORT:-8191}:8191"
+    depends_on:
+      privoxy:
+        condition: service_started
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8191/ >/dev/null"]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 30s
+    networks:
+      - grok-net
+
+volumes:
+  grok-data:
+
+networks:
+  grok-net:
+    driver: bridge

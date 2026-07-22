@@ -533,3 +533,15 @@ MIT（与上游 grok-free-register 思路一致；本仓库为 Go 重制版。�
 ## 友链
 
 - [LinuxDo · Charles0509](https://linux.do/u/charles0509)
+
+
+---
+
+## Docker
+
+```bash
+docker compose build && docker compose up -d
+docker compose exec grok grok start -t 5 --thread 2
+```
+
+详见 [DOCKER.md](DOCKER.md)。

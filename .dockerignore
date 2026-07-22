@@ -1,0 +1,20 @@
+# Build context hygiene
+.git
+.tools
+.idea
+.vscode
+*.log
+*.exe
+bin/
+data/
+**/.DS_Store
+**/node_modules
+**/__pycache__
+**/*.pyc
+config.env
+.env
+*.pem
+*.key
+README.md
+docker-compose.yml
+clearance/docker-compose.yml
